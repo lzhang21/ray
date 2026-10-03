@@ -141,7 +141,9 @@ class TestReadBigQuery:
         poisoned = pa.table(
             {"id": [1, 2], "evil": ArrowPythonObjectArray.from_objects([Exploit()] * 2)}
         )
-        bqs_client_full_mock.read_rows.return_value.to_arrow.return_value = poisoned
+        page = mock.Mock()
+        page.to_arrow.return_value = poisoned.to_batches()[0]
+        bqs_client_full_mock.read_rows.return_value.rows.return_value.pages = [page]
 
         bq_ds = BigQueryDatasource(
             project_id=_TEST_GCP_PROJECT_ID,
@@ -152,6 +154,59 @@ class TestReadBigQuery:
             list(read_task())
 
         assert not marker.exists(), "pickle.load executed attacker code"
+
+    def test_read_yields_block_per_page(self, bqs_client_full_mock):
+        batches = [
+            pa.record_batch({"id": [1, 2]}),
+            pa.record_batch({"id": [3]}),
+            pa.record_batch({"id": [4, 5, 6]}),
+        ]
+        pages = []
+        for batch in batches:
+            page = mock.Mock()
+            page.to_arrow.return_value = batch
+            pages.append(page)
+        bqs_client_full_mock.read_rows.return_value.rows.return_value.pages = pages
+
+        bq_ds = BigQueryDatasource(
+            project_id=_TEST_GCP_PROJECT_ID,
+            dataset=_TEST_BQ_DATASET,
+        )
+        read_task = bq_ds.get_read_tasks(1)[0]
+        blocks = list(read_task())
+
+        assert [block.num_rows for block in blocks] == [2, 1, 3]
+        assert all(isinstance(block, pa.Table) for block in blocks)
+
+    def test_read_options_passed_to_session(self, bqs_client_full_mock):
+        sessions = []
+
+        def create_read_session(max_stream_count=0, read_session=None, **kwargs):
+            sessions.append(read_session)
+            read_session_proto = gcbqs_stream.ReadSession()
+            read_session_proto.streams = [
+                gcbqs_stream.ReadStream() for _ in range(max_stream_count)
+            ]
+            return read_session_proto
+
+        bqs_client_full_mock.create_read_session = create_read_session
+
+        BigQueryDatasource(
+            project_id=_TEST_GCP_PROJECT_ID,
+            dataset=_TEST_BQ_DATASET,
+            row_restriction="event_date >= '2026-09-01'",
+            selected_fields=["user_id", "event_type"],
+        ).get_read_tasks(2)
+        BigQueryDatasource(
+            project_id=_TEST_GCP_PROJECT_ID,
+            dataset=_TEST_BQ_DATASET,
+        ).get_read_tasks(2)
+
+        filtered, unfiltered = sessions
+        assert filtered.read_options.row_restriction == "event_date >= '2026-09-01'"
+        assert list(filtered.read_options.selected_fields) == ["user_id", "event_type"]
+        assert unfiltered.read_options.row_restriction == ""
+        assert list(unfiltered.read_options.selected_fields) == []
 
     @pytest.mark.parametrize(
         "parallelism",

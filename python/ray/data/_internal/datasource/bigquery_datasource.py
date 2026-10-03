@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Iterator, List, Optional
 
 from ray.data._internal.object_extensions.arrow import raise_on_pickle_object_columns
 from ray.data._internal.util import _check_import
@@ -57,6 +57,8 @@ class BigQueryDatasource(Datasource):
         project_id: str,
         dataset: Optional[str] = None,
         query: Optional[str] = None,
+        row_restriction: Optional[str] = None,
+        selected_fields: Optional[List[str]] = None,
     ):
         _check_import(self, module="google.cloud", package="bigquery")
         _check_import(self, module="google.cloud", package="bigquery_storage")
@@ -65,6 +67,8 @@ class BigQueryDatasource(Datasource):
         self._project_id = project_id
         self._dataset = dataset
         self._query = query
+        self._row_restriction = row_restriction
+        self._selected_fields = selected_fields
 
         if query is not None and dataset is not None:
             raise ValueError(
@@ -80,14 +84,20 @@ class BigQueryDatasource(Datasource):
     ) -> List[ReadTask]:
         from google.cloud import bigquery_storage
 
-        def _read_single_partition(stream) -> Block:
+        def _read_single_partition(stream) -> Iterator[Block]:
+            import pyarrow
+
             client = _create_read_client()
             reader = client.read_rows(stream.name)
-            table = reader.to_arrow()
-            # Unpickling untrusted data can execute arbitrary code. Reject object
-            # columns unless the user has explicitly opted in.
-            raise_on_pickle_object_columns(table)
-            return table
+            # Yield a block per received page so memory per task stays near one
+            # page, instead of holding the whole stream (which grows with table
+            # size) before anything is passed downstream.
+            for page in reader.rows().pages:
+                table = pyarrow.Table.from_batches([page.to_arrow()])
+                # Unpickling untrusted data can execute arbitrary code. Reject object
+                # columns unless the user has explicitly opted in.
+                raise_on_pickle_object_columns(table)
+                yield table
 
         if self._query:
             query_client = _create_client(project_id=self._project_id)
@@ -106,9 +116,16 @@ class BigQueryDatasource(Datasource):
 
         if parallelism == -1:
             parallelism = None
+        read_options = None
+        if self._row_restriction or self._selected_fields:
+            read_options = bigquery_storage.types.ReadSession.TableReadOptions(
+                row_restriction=self._row_restriction or "",
+                selected_fields=self._selected_fields or [],
+            )
         requested_session = bigquery_storage.types.ReadSession(
             table=table,
             data_format=bigquery_storage.types.DataFormat.ARROW,
+            read_options=read_options,
         )
         read_session = bqs_client.create_read_session(
             parent=f"projects/{self._project_id}",
@@ -136,7 +153,7 @@ class BigQueryDatasource(Datasource):
 
             # Create the read task and pass the no-arg wrapper and metadata in
             read_task = ReadTask(
-                lambda stream=stream: [_read_single_partition(stream)],
+                lambda stream=stream: _read_single_partition(stream),
                 metadata,
                 per_task_row_limit=per_task_row_limit,
             )

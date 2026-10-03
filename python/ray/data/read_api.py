@@ -1496,6 +1496,8 @@ def read_bigquery(
     dataset: Optional[str] = None,
     query: Optional[str] = None,
     *,
+    row_restriction: Optional[str] = None,
+    selected_fields: Optional[List[str]] = None,
     parallelism: int = -1,
     num_cpus: Optional[float] = None,
     num_gpus: Optional[float] = None,
@@ -1552,6 +1554,13 @@ def read_bigquery(
             Both the dataset_id and table_id must exist otherwise an exception will be raised.
         query: The SQL query to execute. `query` and `dataset` are mutually exclusive.
             If `query` is provided, the query result is read as the dataset.
+        row_restriction: A SQL filter that BigQuery applies before sending rows, like
+            a ``WHERE`` clause without aggregates (for example,
+            ``"event_date >= '2026-09-01'"``). Filters on partition or clustering
+            columns skip the non-matching data. With ``dataset``, no query runs, so
+            the query result size limit doesn't apply.
+        selected_fields: Names of the columns to read. BigQuery sends only these
+            columns. By default, all columns are read.
         parallelism: This argument is deprecated. Use ``override_num_blocks`` argument.
         num_cpus: The number of CPUs to reserve for each parallel read worker.
         num_gpus: The number of GPUs to reserve for each parallel read worker. For
@@ -1582,7 +1591,13 @@ def read_bigquery(
         Dataset producing rows from the results of executing the query (or reading the entire dataset)
         on the specified BigQuery dataset.
     """  # noqa: E501
-    datasource = BigQueryDatasource(project_id=project_id, dataset=dataset, query=query)
+    datasource = BigQueryDatasource(
+        project_id=project_id,
+        dataset=dataset,
+        query=query,
+        row_restriction=row_restriction,
+        selected_fields=selected_fields,
+    )
     return read_datasource(
         datasource,
         num_cpus=num_cpus,
